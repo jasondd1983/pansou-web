@@ -29,7 +29,7 @@ jobs:
       with:
         repository: fish2018/pansou
         path: backend
-        # 如果后端仓库是私有的，需要配置token
+        # 如果后端仓库是私有，需要配置token
         # token: ${{ secrets.BACKEND_REPO_TOKEN }}
 
     - name: Set up Node.js
