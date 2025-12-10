@@ -78,7 +78,7 @@ Docker会自动选择适合您系统的架构版本。
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `CACHE_ENABLED` | `true` | 是否启用缓存 |
-| `CACHE_TTL` | `3600` | 缓存过期时间（秒） |
+| `CACHE_TTL` | `60` | 缓存过期时间（分） |
 | `MAX_CONCURRENCY` | `200` | 最大并发数 |
 | `MAX_PAGES` | `30` | 最大搜索页数 |
 
@@ -135,10 +135,9 @@ docker run -d \
 docker run -d \
   --name pansou \
   -p 80:80 \
-  -e PROXY=socks5://127.0.0.1:7897 \
+  -e PROXY=socks5://xxx.xxx.xxx.xxx:7897 \
   -v pansou-data:/app/data \
   --restart unless-stopped \
-  --network host \
   ghcr.io/fish2018/pansou-web:latest
 ```
 

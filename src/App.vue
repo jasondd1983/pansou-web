@@ -11,6 +11,7 @@ import LoginDialog from '@/components/LoginDialog.vue';
 import QQPDManager from '@/components/QQPDManager.vue';
 import AccountCenter from '@/components/AccountCenter.vue';
 import GyingManager from '@/components/GyingManager.vue';
+import WeiboManager from '@/components/WeiboManager.vue';
 
 // 后端健康状态缓存（应用启动时获取一次）
 const backendHealth = ref<HealthStatus | null>(null);
@@ -42,8 +43,11 @@ const hasSearched = ref(false);
 // 是否正在进行后台搜索（包括初始搜索和后续更新）
 const isActivelySearching = ref(false);
 
+// 强制刷新逻辑
+let forceRefreshPending = false;
+
 // 当前页面状态
-const currentPage = ref<'search' | 'status' | 'docs' | 'accounts' | 'qqpd' | 'gying'>('search');
+const currentPage = ref<'search' | 'status' | 'docs' | 'accounts' | 'qqpd' | 'gying' | 'weibo'>('search');
 
 // 登录状态
 const showLogin = ref(false);
@@ -56,9 +60,12 @@ const isQQPDEnabled = ref(false);
 // Gying插件状态
 const isGyingEnabled = ref(false);
 
+// Weibo插件状态
+const isWeiboEnabled = ref(false);
+
 // 检查是否有需要账号管理的服务
 const hasAccountServices = computed(() => {
-  return isQQPDEnabled.value || isGyingEnabled.value;
+  return isQQPDEnabled.value || isGyingEnabled.value || isWeiboEnabled.value;
 });
 
 // 页面切换
@@ -82,12 +89,18 @@ const switchToGying = () => {
   currentPage.value = 'gying';
 };
 
+const switchToWeibo = () => {
+  currentPage.value = 'weibo';
+};
+
 // 从账号中心导航到具体服务
-const handleAccountNavigate = (service: 'qqpd' | 'gying') => {
+const handleAccountNavigate = (service: 'qqpd' | 'gying' | 'weibo') => {
   if (service === 'qqpd') {
     switchToQQPD();
   } else if (service === 'gying') {
     switchToGying();
+  } else if (service === 'weibo') {
+    switchToWeibo();
   }
 };
 
@@ -136,32 +149,37 @@ const checkConfig = () => {
 const handleSearch = async (params: SearchParams) => {
   // 停止之前的更新
   stopUpdate();
-  
-  // 标记已执行搜索和正在搜索
+
+  // 先保存用户输入的原始参数，不带 refresh
+  lastSearchParams.value = { ...params };
+
+  // 强制刷新: 只影响本次请求参数
+  let innerParams = { ...params };
+  if (forceRefreshPending) {
+    innerParams.refresh = true;
+    forceRefreshPending = false;
+  }
+
+  // 标记状态
   hasSearched.value = true;
   isActivelySearching.value = true;
-  
-  // 重置状态
   loading.value = true;
-  
+
   // 清空之前的搜索结果
   searchResults.total = 0;
   searchResults.mergedResults = {};
   searchTime.value = undefined;
-  
-  // 保存搜索参数
-  lastSearchParams.value = { ...params };
-  
+
   const startTime = Date.now();
-  
-  // 检查配置（用户设置或后端默认缓存）
+
+  // 配置
   const config = checkConfig();
   const hasChannels = config.channels.length > 0;
   const hasPlugins = config.plugins.length > 0;
-  
+
   try {
-    // 直接使用用户配置的搜索参数（SearchForm已经根据配置设置了正确的src）
-    const userParams: SearchParams = { ...params };
+    // 只用 innerParams，确保 refresh 只传一次
+    const userParams: SearchParams = { ...innerParams };
     
     // 如果同时启用了TG和插件，立即发起后台预热搜索（忽略结果）
     if (hasChannels && hasPlugins) {
@@ -237,6 +255,60 @@ const handleSearchComplete = () => {
   // 只处理UI相关的状态，不影响搜索流程
 };
 
+// 应用关键词过滤（后端filter参数已经处理，这里保留作为备用）
+const applyKeywordFilter = (results: any, filterStr: string) => {
+  if (!results || !filterStr.trim()) return results;
+  
+  try {
+    const filter = JSON.parse(filterStr);
+    const includeKeywords = (filter.include || []).map((k: string) => k.toLowerCase());
+    const excludeKeywords = (filter.exclude || []).map((k: string) => k.toLowerCase());
+    
+    if (includeKeywords.length === 0 && excludeKeywords.length === 0) {
+      return results;
+    }
+    
+    const filteredResults: any = {};
+    
+    // 遍历每个网盘类型的结果
+    Object.keys(results).forEach(diskType => {
+      const diskResults = results[diskType];
+      if (!Array.isArray(diskResults)) return;
+      
+      // 过滤每个结果项
+      const filtered = diskResults.filter((item: any) => {
+        const note = (item.note || '').toLowerCase();
+        const source = (item.source || '').toLowerCase();
+        const searchText = `${note} ${source}`;
+        
+        // 包含检查 (OR关系)：如果有include，必须至少包含一个
+        if (includeKeywords.length > 0) {
+          const hasInclude = includeKeywords.some(keyword => searchText.includes(keyword));
+          if (!hasInclude) return false;
+        }
+        
+        // 排除检查 (OR关系)：如果有exclude，包含任意一个就排除
+        if (excludeKeywords.length > 0) {
+          const hasExclude = excludeKeywords.some(keyword => searchText.includes(keyword));
+          if (hasExclude) return false;
+        }
+        
+        return true;
+      });
+      
+      // 只保留有结果的网盘类型
+      if (filtered.length > 0) {
+        filteredResults[diskType] = filtered;
+      }
+    });
+    
+    return filteredResults;
+  } catch (error) {
+    console.error('过滤参数解析失败:', error);
+    return results;
+  }
+};
+
 // 更新搜索结果
 const updateSearchResults = (response: SearchResponse) => {
   if (!response) return;
@@ -244,7 +316,15 @@ const updateSearchResults = (response: SearchResponse) => {
   searchResults.total = response.total || 0;
   
   if (response.merged_by_type) {
-    searchResults.mergedResults = { ...response.merged_by_type };
+    let results = { ...response.merged_by_type };
+    
+    // 注意：后端已经处理了filter参数，这里不再需要前端过滤
+    // 保留以下代码作为备用，但不执行
+    // if (lastSearchParams.value && (lastSearchParams.value as any).filter) {
+    //   results = applyKeywordFilter(results, (lastSearchParams.value as any).filter);
+    // }
+    
+    searchResults.mergedResults = results;
   } else {
     console.warn('搜索结果中没有merged_by_type字段');
     searchResults.mergedResults = {};
@@ -452,7 +532,12 @@ const stopUpdate = () => {
   isActivelySearching.value = false;
 };
 
-// 重置到初始页面
+// 切换到搜索页面（保持搜索结果）
+const switchToSearch = () => {
+  currentPage.value = 'search';
+};
+
+// 重置到初始页面（清空搜索结果，仅在必要时使用）
 const resetToInitial = () => {
   // 停止之前的更新
   stopUpdate();
@@ -597,12 +682,42 @@ const checkGyingPlugin = () => {
   }
 };
 
+// 检查Weibo插件是否启用
+const checkWeiboPlugin = () => {
+  try {
+    const backendSupportsWeibo = backendHealth.value?.plugins?.includes('weibo') || false;
+    
+    if (!backendSupportsWeibo) {
+      isWeiboEnabled.value = false;
+      return;
+    }
+    
+    try {
+      const savedPlugins = localStorage.getItem('pansou_plugins');
+      
+      if (savedPlugins === null) {
+        isWeiboEnabled.value = true;
+      } else {
+        const plugins = JSON.parse(savedPlugins);
+        isWeiboEnabled.value = Array.isArray(plugins) && plugins.includes('weibo');
+      }
+    } catch (err) {
+      console.error('读取用户插件配置失败:', err);
+      isWeiboEnabled.value = true;
+    }
+  } catch (error) {
+    console.error('检查Weibo插件失败:', error);
+    isWeiboEnabled.value = false;
+  }
+};
+
 // 监听localStorage变化，当用户配置改变时更新插件状态
 const handleStorageChange = (e: StorageEvent) => {
   // 只关心插件配置的变化
   if (e.key === 'pansou_plugins') {
     checkQQPDPlugin();
     checkGyingPlugin();
+    checkWeiboPlugin();
   }
 };
 
@@ -610,6 +725,17 @@ const handleStorageChange = (e: StorageEvent) => {
 const handleConfigSaved = () => {
   checkQQPDPlugin();
   checkGyingPlugin();
+  checkWeiboPlugin();
+};
+
+// 强制刷新处理
+const handleForceRefresh = () => {
+  if (loading.value) return;
+  forceRefreshPending = true;
+  // 复用handleSearch最近一次参数
+  if (lastSearchParams.value) {
+    handleSearch({ ...lastSearchParams.value });
+  }
 };
 
 // 组件加载时初始化
@@ -621,6 +747,7 @@ onMounted(async () => {
   checkAuth();
   checkQQPDPlugin();
   checkGyingPlugin();
+  checkWeiboPlugin();
   
   // 监听事件
   window.addEventListener('auth:required', handleAuthRequired);
@@ -651,7 +778,7 @@ onUnmounted(() => {
     <!-- 导航栏 -->
     <nav class="nav-header backdrop-blur-md bg-background/80 border-b border-border">
       <div class="container mx-auto px-4 h-16 flex items-center justify-between">
-        <div class="flex items-center gap-3 cursor-pointer" @click="resetToInitial">
+        <div class="flex items-center gap-3 cursor-pointer" @click="switchToSearch">
           <div class="w-8 h-8 bg-primary rounded-lg flex items-center justify-center">
             <svg class="w-5 h-5 text-primary-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
@@ -664,6 +791,19 @@ onUnmounted(() => {
         
         <!-- 导航菜单 -->
         <nav class="flex items-center gap-2">
+          <button 
+            @click="switchToSearch"
+            class="nav-button"
+            :class="{ 'active': currentPage === 'search' }"
+            title="搜索"
+          >
+            <span class="nav-icon">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+              </svg>
+            </span>
+            <span class="nav-text">搜索</span>
+          </button>
           <button 
             @click="switchToStatus"
             class="nav-button"
@@ -699,7 +839,7 @@ onUnmounted(() => {
             v-if="hasAccountServices"
             @click="switchToAccounts"
             class="nav-button"
-            :class="{ 'active': currentPage === 'accounts' || currentPage === 'qqpd' || currentPage === 'gying' }"
+            :class="{ 'active': currentPage === 'accounts' || currentPage === 'qqpd' || currentPage === 'gying' || currentPage === 'weibo' }"
             title="账号管理"
           >
             <span class="nav-icon">
@@ -748,6 +888,7 @@ onUnmounted(() => {
             :searchTime="searchTime"
             :isUpdating="isUpdating"
             :updateCount="updateCount"
+            @force-refresh="handleForceRefresh"
           />
         </div>
         
@@ -800,6 +941,11 @@ onUnmounted(() => {
       <div v-else-if="currentPage === 'gying'" class="gying-page">
         <GyingManager @back-to-center="switchToAccounts" />
       </div>
+      
+      <!-- 微博管理页面 -->
+      <div v-else-if="currentPage === 'weibo'" class="weibo-page">
+        <WeiboManager @back-to-center="switchToAccounts" />
+      </div>
     </main>
     
     <!-- 页脚 -->
@@ -808,6 +954,7 @@ onUnmounted(() => {
         <div class="flex items-center justify-center gap-4 text-sm text-muted-foreground">
           <span>© {{ new Date().getFullYear() }}-{{ new Date().getFullYear() + 10 }}</span>
           <a href="https://dm.xueximeng.com/" target="_blank" rel="noopener noreferrer" class="hover:text-foreground transition-colors">美漫资源共建</a>
+          <a href="/report.html" target="_blank" rel="noopener noreferrer" class="hover:text-foreground transition-colors">实时监控</a>
           <a href="https://github.com/fish2018" target="_blank" rel="noopener noreferrer" class="hover:text-foreground transition-colors">
             <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
               <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/>
